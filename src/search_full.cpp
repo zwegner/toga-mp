@@ -840,11 +840,11 @@ static int full_search(board_t * board, search_param_t * search_stack,  int alph
       // Split the tree if there are idle threads.
       if (idle_count > 0 && !in_check && node_type == NodeAll && played_nb > SplitMoveNb && depth >= SplitDepth) {
 #   ifdef SMP_DEBUG
-         send("%*scall%i=%i(%i,%i)\n",SplitCount[board->id],"",board->id,value,alpha,beta);
+         send("%*scall%i=%i(%i,%i)\n",Thread[board->id].split_count,"",board->id,value,alpha,beta);
 #   endif
          value = split(board,alpha,beta,depth,height,pv,sort,node_type,mate_threat);
 #  ifdef SMP_DEBUG
-         send("%*sreturned%i=%i(%i,%i)\n",SplitCount[board->id],"",board->id,value,alpha,beta);
+         send("%*sreturned%i=%i(%i,%i)\n",Thread[board->id].split_count,"",board->id,value,alpha,beta);
 #  endif
          CHECK_STOP(false);
          if (value != ValueNone) {

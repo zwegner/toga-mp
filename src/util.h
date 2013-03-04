@@ -62,6 +62,13 @@ const int ThreadMax = 1;
 #  define ASSERT(a)
 #endif
 
+// alignment macros
+
+#ifdef _MSC_VER
+#  define ALIGN(s) __declspec(align(s))
+#else
+#  define ALIGN(s) __attribute__((aligned(s)))
+#endif
 
 // types
 

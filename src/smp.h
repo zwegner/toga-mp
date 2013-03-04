@@ -67,7 +67,7 @@ const int SplitMax = 2;
 
 // types
 
-struct split_t {
+struct ALIGN(64) split_t {
    struct board_t board[ThreadMax];
    int parent;
    volatile bool child[ThreadMax];
@@ -85,11 +85,12 @@ struct split_t {
    lock_t lock;
 };
 
-struct thread_t {
+struct ALIGN(64) thread_t {
    volatile bool running;
    volatile bool idle;
    volatile bool work_available;
    volatile bool split_stop;
+   int split_count;
    split_t *split_point;
    sint64 node_nb;
 #ifdef _MSC_VER
@@ -104,7 +105,6 @@ struct thread_t {
 extern int thread_count;
 extern split_t SplitPoint[ThreadMax][SplitMax];
 extern thread_t Thread[ThreadMax];
-extern int SplitCount[ThreadMax];
 extern int idle_count;
 extern lock_t SmpLock;
 extern lock_t IOLock;

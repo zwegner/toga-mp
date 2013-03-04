@@ -29,7 +29,6 @@ static int thread_wait(int id, split_t * split_point);
 int thread_count;
 split_t SplitPoint[ThreadMax][SplitMax];
 thread_t Thread[ThreadMax];
-int SplitCount[ThreadMax];
 int idle_count;
 lock_t SmpLock;
 lock_t IOLock;
@@ -73,7 +72,7 @@ void smp_init(int threads) {
    for (thread = 0; thread < thread_count; thread++) {
       Thread[thread].work_available = false;
       Thread[thread].running = false;
-      SplitCount[thread] = 0;
+      Thread[thread].split_count = 0;
       if (thread > 0) {
 #ifdef _MSC_VER
          DWORD id[1];
@@ -180,9 +179,9 @@ int split(board_t * board, int alpha, int beta, int depth, int height, mv_t * pv
    split_t *split_point;
    split_t *old_split_point;
 
-   if (SplitCount[board->id] == SplitMax)
+   if (Thread[board->id].split_count == SplitMax)
       return ValueNone;
-   split_point = &SplitPoint[board->id][SplitCount[board->id]++];
+   split_point = &SplitPoint[board->id][Thread[board->id].split_count++];
 
    LOCK_SET(SmpLock);
    // Check that there are still idle threads.
@@ -236,7 +235,7 @@ int split(board_t * board, int alpha, int beta, int depth, int height, mv_t * pv
    // Destroy the split point.
    split_point->active = false;
    split_point->stop = false;
-   SplitCount[board->id]--;
+   Thread[board->id].split_count--;
 
    // Restore any split-related information that might have been in this thread.
    Thread[board->id].split_point = old_split_point;
