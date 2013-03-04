@@ -13,12 +13,14 @@
 #include "move_do.h"
 #include "option.h"
 #include "piece.h"
+#include "protocol.h"
 #include "pst.h"
 #include "pv.h"
 #include "recog.h"
 #include "search.h"
 #include "search_full.h"
 #include "see.h"
+#include "smp.h"
 #include "sort.h"
 #include "trans.h"
 #include "util.h"
@@ -27,6 +29,16 @@
 #define ABS(x) ((x)<0?-(x):(x))
 #define MIN(X, Y)  ((X) < (Y) ? (X) : (Y))
 #define R_adpt(max_pieces, depth, Reduction) (Reduction + ((depth) > (9 + ((max_pieces<3) ? 2 : 0))))
+
+#ifdef SMP
+#define CHECK_STOP(u) \
+   if (SearchInfo->stop || (Thread[board->id].split_point != NULL && Thread[board->id].split_point->stop)) { \
+      if (u) move_undo(board,move,undo); \
+      return ValueNone; \
+   }
+#else
+#define CHECK_STOP(u)
+#endif
 
 
 // constants and variables
@@ -75,7 +87,7 @@ static const bool HistoryReSearch = true;
 
 // futility pruning
 
-static /* const */ bool UseFutility = true; // false
+static /* const */ bool UseFutility = true;
 static const int FutilityMargin = 100;
 static /* const */ int FutilityMargin1 = 100;
 static /* const */ int FutilityMargin2 = 300;
@@ -88,6 +100,11 @@ static /* const */ int DeltaMargin = 50;
 
 static /* const */ int CheckNb = 1;
 static /* const */ int CheckDepth = 0; // 1 - CheckNb
+
+// smp search
+
+static const int SplitDepth = 4;
+static const int SplitMoveNb = 3;
 
 // misc
 
@@ -104,10 +121,10 @@ static const int NodeCut = +1;
 
 static int  full_root            (list_t * list, board_t * board, int alpha, int beta, int depth, int height, int search_type);
 
-static int  full_search          (board_t * board, int alpha, int beta, int depth, int height, mv_t pv[], int node_type);
-static int  full_no_null         (board_t * board, int alpha, int beta, int depth, int height, mv_t pv[], int node_type, int trans_move, int * best_move);
+static int  full_search          (board_t * board, search_param_t * search_stack, int alpha, int beta, int depth, int height, mv_t pv[], int node_type);
+static int  full_no_null         (board_t * board, search_param_t * search_stack, int alpha, int beta, int depth, int height, mv_t pv[], int node_type, int trans_move, int * best_move);
 
-static int  full_quiescence      (board_t * board, int alpha, int beta, int depth, int height, mv_t pv[]);
+static int  full_quiescence      (board_t * board, search_param_t * search_stack, int alpha, int beta, int depth, int height, mv_t pv[]);
 
 static int  full_new_depth       (int depth, int move, board_t * board, bool single_reply, bool mate_threat, bool in_pv, int height);
 
@@ -210,7 +227,8 @@ void search_full_init(list_t * list, board_t * board) {
    // basic sort
 
    trans_move = MoveNone;
-   if (UseTrans) trans_retrieve(Trans,board->key,&trans_move,&trans_min_depth,&trans_max_depth,&trans_min_value,&trans_max_value);
+   if (UseTrans) trans_retrieve(Trans,board->key,&trans_move,&trans_min_depth,
+   &trans_max_depth,&trans_min_value,&trans_max_value);
 
    note_moves(list,board,0,trans_move);
    list_sort(list);
@@ -231,6 +249,7 @@ int search_full_root(list_t * list, board_t * board, int depth, int search_type)
    ASSERT(!LIST_IS_EMPTY(list));
    ASSERT(board==SearchCurrent->board);
    ASSERT(board_is_legal(board));
+   ASSERT(board->id == 0);
    ASSERT(depth>=1);
 
    if (SearchBest[SearchCurrent->multipv].value == 0){
@@ -243,7 +262,7 @@ int search_full_root(list_t * list, board_t * board, int depth, int search_type)
    }
 
    if (SearchInput->multipv > 0){
-	   a = -ValueInf;
+       a = -ValueInf;
        b = +ValueInf;
    }
 
@@ -260,12 +279,15 @@ int search_full_root(list_t * list, board_t * board, int depth, int search_type)
 static int full_root(list_t * list, board_t * board, int alpha, int beta, int depth, int height, int search_type) {
 
    int old_alpha;
-   int value, best_value[MultiPVMax];
+   int value, best_value;
    int i, move, j;
    int new_depth;
    undo_t undo[1];
    mv_t new_pv[HeightMax];
    bool found;
+   search_param_t *search_stack = SearchStack[0];
+   sint64 last_nodes, best_nodes;
+   sint16 *next_best_value;
 
    ASSERT(list_is_ok(list));
    ASSERT(board_is_ok(board));
@@ -278,23 +300,27 @@ static int full_root(list_t * list, board_t * board, int alpha, int beta, int de
    ASSERT(!LIST_IS_EMPTY(list));
    ASSERT(board==SearchCurrent->board);
    ASSERT(board_is_legal(board));
+   ASSERT(board->id == 0);
    ASSERT(depth>=1);
 
    // init
 
-   SearchStack[height].best_move = MoveNone;
-   SearchStack[height].move = MoveNone;
-   SearchStack[height].threat_move = MoveNone;
-   SearchStack[height].reduced = false;
+   search_stack[height].best_move = MoveNone;
+   search_stack[height].move = MoveNone;
+   search_stack[height].threat_move = MoveNone;
+   search_stack[height].reduced = false;
 
-   SearchCurrent->node_nb++;
+   Thread[0].node_nb++;
    SearchInfo->check_nb--;
 
    if (SearchCurrent->multipv == 0)
 	  for (i = 0; i < LIST_SIZE(list); i++) list->value[i] = ValueNone;
 
    old_alpha = alpha;
-   best_value[SearchCurrent->multipv] = ValueNone;
+   best_value = ValueNone;
+
+   best_nodes = 0;
+   next_best_value = NULL;
 
    // move loop
 
@@ -313,7 +339,7 @@ static int full_root(list_t * list, board_t * board, int alpha, int beta, int de
 		  if (found == true)
 				continue;
 	  }
-	  SearchStack[height].move = move;
+	  search_stack[height].move = move;
 
       SearchRoot->depth = depth;
       SearchRoot->move = move;
@@ -321,62 +347,71 @@ static int full_root(list_t * list, board_t * board, int alpha, int beta, int de
       SearchRoot->move_nb = LIST_SIZE(list);
 
       search_update_root();
+      last_nodes = SearchCurrent->node_nb;
 
       new_depth = full_new_depth(depth,move,board,board_is_check(board)&&LIST_SIZE(list)==1,false,true, height);
 
       move_do(board,move,undo);
 
-      if (search_type == SearchShort || best_value[SearchCurrent->multipv] == ValueNone) { // first move
-         value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
-		 if (value <= alpha){ // research
-			 old_alpha = -ValueInf;
-			 value = -full_search(board,-beta,ValueInf,new_depth,height+1,new_pv,NodePV);
-		 }
-		 else if (value >= beta){ // research
-			 value = -full_search(board,-ValueInf,-alpha,new_depth,height+1,new_pv,NodePV);
-		 }
-			  
+      if (search_type == SearchShort || best_value == ValueNone) { // first move
+         value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
+         if (value <= alpha){ // research
+            old_alpha = alpha = -ValueInf;
+            value = -full_search(board,search_stack,-beta,ValueInf,new_depth,height+1,new_pv,NodePV);
+         }
+         else if (value >= beta){ // research
+            if (beta + 100 < ValueMate) // Do not open the window up to infinity yet.
+               value = -full_search(board,search_stack,-beta-100,-alpha,new_depth,height+1,new_pv,NodePV);
+            if (value >= beta)
+               value = -full_search(board,search_stack,-ValueInf,-alpha,new_depth,height+1,new_pv,NodePV);
+         }
       } else { // other moves
-         value = -full_search(board,-alpha-1,-alpha,new_depth,height+1,new_pv,NodeCut);
+         value = -full_search(board,search_stack,-alpha-1,-alpha,new_depth,height+1,new_pv,NodeCut);
          if (value > alpha) { // && value < beta
             SearchRoot->change = true;
             SearchRoot->easy = false;
             SearchRoot->flag = false;
             search_update_root();
-            value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
+            value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
          }
       }
 
       move_undo(board,move,undo);
 
+      // Order second best by node count
+      search_update_current();
+      if (best_value > ValueNone && value <= alpha && SearchCurrent->node_nb - last_nodes > best_nodes) {
+         best_nodes = SearchCurrent->node_nb - last_nodes;
+         next_best_value = &list->value[i];
+      }
+
       if (value <= alpha) { // upper bound
-         list->value[i] = old_alpha;
+         list->value[i] = -ValueInf;
       } else if (value >= beta) { // lower bound
-         list->value[i] = beta;
+         list->value[i] = ValueInf;
       } else { // alpha < value < beta => exact value
          list->value[i] = value;
       }
 
-      if (value > best_value[SearchCurrent->multipv] && (best_value[SearchCurrent->multipv] == ValueNone || value > alpha)) {
+      if (value > best_value) {
+         if (best_value == ValueNone || value > alpha) {
+            search_stack[height].best_move = move;
+            SearchBest[SearchCurrent->multipv].value = value;
+            SearchBest[SearchCurrent->multipv].move = move;
+            if (value <= alpha) { // upper bound
+               SearchBest[SearchCurrent->multipv].flags = SearchUpper;
+            } else if (value >= beta) { // lower bound
+               SearchBest[SearchCurrent->multipv].flags = SearchLower;
+            } else { // alpha < value < beta => exact value
+               SearchBest[SearchCurrent->multipv].flags = SearchExact;
+            }
+            SearchBest[SearchCurrent->multipv].depth = depth;
+            pv_cat(SearchBest[SearchCurrent->multipv].pv,new_pv,move);
 
-         SearchBest[SearchCurrent->multipv].move = move;
-		 SearchStack[height].best_move = move;
-         SearchBest[SearchCurrent->multipv].value = value;
-         if (value <= alpha) { // upper bound
-            SearchBest[SearchCurrent->multipv].flags = SearchUpper;
-         } else if (value >= beta) { // lower bound
-            SearchBest[SearchCurrent->multipv].flags = SearchLower;
-         } else { // alpha < value < beta => exact value
-            SearchBest[SearchCurrent->multipv].flags = SearchExact;
+            search_update_best();
          }
-         SearchBest[SearchCurrent->multipv].depth = depth;
-         pv_cat(SearchBest[SearchCurrent->multipv].pv,new_pv,move);
 
-         search_update_best();
-      }
-
-      if (value > best_value[SearchCurrent->multipv]) {
-         best_value[SearchCurrent->multipv] = value;
+         best_value = value;
          if (value > alpha) {
             if (search_type == SearchNormal) alpha = value;
             if (value >= beta) break;
@@ -386,21 +421,25 @@ static int full_root(list_t * list, board_t * board, int alpha, int beta, int de
 
    ASSERT(value_is_ok(best_value));
 
+   if (next_best_value != NULL)
+      *next_best_value = -ValueInf + 1;
+
    list_sort(list);
 
    ASSERT(SearchBest->move==LIST_MOVE(list,0));
    ASSERT(SearchBest->value==best_value);
 
-   if (UseTrans && best_value[SearchCurrent->multipv] > old_alpha && best_value[SearchCurrent->multipv] < beta) {
+   if (UseTrans && best_value > old_alpha && best_value < beta) {
       pv_fill(SearchBest[SearchCurrent->multipv].pv,board);
    }
 
-   return best_value[SearchCurrent->multipv];
+   return best_value;
 }
 
 // full_search()
 
-static int full_search(board_t * board, int alpha, int beta, int depth, int height, mv_t pv[], int node_type) {
+static int full_search(board_t * board, search_param_t * search_stack,  int alpha, int beta, int depth,
+ int height, mv_t pv[], int node_type) {
 
    bool in_check;
    bool single_reply;
@@ -423,6 +462,8 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
    mv_t played[256];
    int FutilityMargin;
 
+   CHECK_STOP(false);
+
    ASSERT(board!=NULL);
    ASSERT(range_is_ok(alpha,beta));
    ASSERT(depth_is_ok(depth));
@@ -439,26 +480,28 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
 			CheckDepth = 1 - CheckNb - 1;
 	   else
 			CheckDepth = 1 - CheckNb;
-	   return full_quiescence(board,alpha,beta,0,height,pv);
+	   return full_quiescence(board,search_stack,alpha,beta,0,height,pv);
    }
 
    // init
 
-   SearchStack[height].best_move = MoveNone;
-   SearchStack[height].move = MoveNone;
-   SearchStack[height].threat_move = MoveNone;
-   SearchStack[height].reduced = false;
+   search_stack[height].best_move = MoveNone;
+   search_stack[height].move = MoveNone;
+   search_stack[height].threat_move = MoveNone;
+   search_stack[height].reduced = false;
    mate_threat = false;
 
-   SearchCurrent->node_nb++;
-   SearchInfo->check_nb--;
+   Thread[board->id].node_nb++;
    PV_CLEAR(pv);
 
    if (height > SearchCurrent->max_depth) SearchCurrent->max_depth = height;
 
-   if (SearchInfo->check_nb <= 0) {
-      SearchInfo->check_nb += SearchInfo->check_inc;
-      search_check();
+   if (board->id == 0) {
+      SearchInfo->check_nb--;
+      if (SearchInfo->check_nb <= 0) {
+         SearchInfo->check_nb += SearchInfo->check_inc;
+         search_check();
+      }
    }
 
    // draw?
@@ -560,8 +603,9 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
 		 //new_depth = depth - R_adpt(board->piece_size[board->turn]+board->pawn_size[board->turn],depth,NullReduction) - 1;
 		 
 	     move_do_null(board,undo);
-         value = -full_search(board,-beta,-beta+1,new_depth,height+1,new_pv,NODE_OPP(node_type));
+         value = -full_search(board,search_stack,-beta,-beta+1,new_depth,height+1,new_pv,NODE_OPP(node_type));
          move_undo_null(board,undo);
+         CHECK_STOP(false);
 
          // verification search
 
@@ -572,14 +616,15 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
                new_depth = depth - VerReduction;
                ASSERT(new_depth>0);
 
-               value = full_no_null(board,alpha,beta,new_depth,height,new_pv,NodeCut,trans_move,&move);
+               value = full_no_null(board,search_stack,alpha,beta,new_depth,height,new_pv,NodeCut,trans_move,&move);
+               CHECK_STOP(false);
 
                if (value >= beta) {
                   ASSERT(move==new_pv[0]);
                   played[played_nb++] = move;
                   best_move = move;
-				  SearchStack[height].move = move;
-				  SearchStack[height].best_move = move;
+				  search_stack[height].move = move;
+				  search_stack[height].best_move = move;
                   best_value = value;
                   pv_copy(pv,new_pv);
                   goto cut;
@@ -600,15 +645,15 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
             best_value = value;
             goto cut;
          }
-		 SearchStack[height].threat_move = SearchStack[height+1].best_move;
-	/*	 if (SearchStack[height-1].reduced){ // Idea by Tord Romstad 
-				if (MOVE_FROM(SearchStack[height+1].best_move) == MOVE_TO(SearchStack[height-1].move))
+		 search_stack[height].threat_move = search_stack[height+1].best_move;
+	/*	 if (search_stack[height-1].reduced){ // Idea by Tord Romstad 
+				if (MOVE_FROM(search_stack[height+1].best_move) == MOVE_TO(search_stack[height-1].move))
 					return alpha-1; */
-		    	/* if(((MOVE_TO(SearchStack[height - 2].threat_move) == MOVE_FROM(SearchStack[height - 2].move))
-					&& (MOVE_TO(SearchStack[height].threat_move) == MOVE_TO(SearchStack[height - 2].move)))
+		    	/* if(((MOVE_TO(search_stack[height - 2].threat_move) == MOVE_FROM(search_stack[height - 2].move))
+					&& (MOVE_TO(search_stack[height].threat_move) == MOVE_TO(search_stack[height - 2].move)))
 				  ||
-				  ((MOVE_TO(SearchStack[height - 2].threat_move) != MOVE_FROM(SearchStack[height - 2].move))
-		            && (MOVE_TO(SearchStack[height].threat_move) == MOVE_TO(SearchStack[height - 2].threat_move))))
+				  ((MOVE_TO(search_stack[height - 2].threat_move) != MOVE_FROM(search_stack[height - 2].move))
+		            && (MOVE_TO(search_stack[height].threat_move) == MOVE_TO(search_stack[height - 2].threat_move))))
 			        return alpha-1; */
 	//	 }
 	  }
@@ -628,8 +673,10 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
 	  new_depth = MIN(depth - IIDReduction,depth/2);
       ASSERT(new_depth>0);
 
-      value = full_search(board,alpha,beta,new_depth,height,new_pv,node_type);
-      if (value <= alpha) value = full_search(board,-ValueInf,beta,new_depth,height,new_pv,node_type);
+      value = full_search(board,search_stack,alpha,beta,new_depth,height,new_pv,node_type);
+      CHECK_STOP(false);
+      if (value <= alpha) value = full_search(board,search_stack,-ValueInf,beta,new_depth,height,new_pv,node_type);
+      CHECK_STOP(false);
 
       trans_move = new_pv[0];
    }
@@ -647,7 +694,7 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
 
    while ((move=sort_next(sort)) != MoveNone) {
 
-	  SearchStack[height].move = move;
+	  search_stack[height].move = move;
 
 	  // history_tried(move,board);
 	  
@@ -715,46 +762,44 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
 	  // history pruning
 
       reduced = false;
-	  value = sort->value; // history score
-      if (!in_check && depth <= 4 && node_type != NodePV && new_depth < depth && value < (depth <= 3 ? HistoryValue / 3 : HistoryValue / 4)) 
-		  continue;
+      value = sort->value; // history score
+  //    if (!in_check && depth <= 4 && node_type != NodePV && new_depth < depth && value < (depth <= 3 ? HistoryValue / 3 : HistoryValue / 4)) 
+    //     continue;
 
 
-      if (UseHistory && depth >= HistoryDepth && node_type != NodePV) {
-         if (!in_check && played_nb >= HistoryMoveNb && new_depth < depth) {
-            ASSERT(best_value!=ValueNone);
-            ASSERT(played_nb>0);
-            ASSERT(sort->pos>0&&move==LIST_MOVE(sort->list,sort->pos-1));
-            value = sort->value; // history score
-            if (value < HistoryValue) {
-               ASSERT(value>=0&&value<16384);
-               ASSERT(move!=trans_move);
-               ASSERT(!move_is_tactical(move,board));
-               ASSERT(!move_is_check(move,board));
+      if (UseHistory && depth >= HistoryDepth && node_type != NodePV && !in_check && played_nb >= HistoryMoveNb && new_depth < depth) {
+         ASSERT(best_value!=ValueNone);
+         ASSERT(played_nb>0);
+         ASSERT(sort->pos>0&&move==LIST_MOVE(sort->list,sort->pos-1));
+         value = sort->value; // history score
+         if (value < HistoryValue) {
+            ASSERT(value>=0&&value<16384);
+            ASSERT(move!=trans_move);
+            ASSERT(!move_is_tactical(move,board));
+            ASSERT(!move_is_check(move,board));
+            new_depth--;
+            reduced = true;
+            if (UseExtendedHistory && value < HistoryValue / 2 && depth >= 8)
                new_depth--;
-               reduced = true;
-			   if (UseExtendedHistory && value < HistoryValue / 2 && depth >= 8){
-				   new_depth--;
-				   
-			   }
-            }
          }
       }   
 
-	  SearchStack[height].reduced = reduced;
+	  search_stack[height].reduced = reduced;
 
       // recursive search
 
 	  move_do(board,move,undo);
 
       if (node_type != NodePV || best_value == ValueNone) { // first move
-		 value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+		 value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
       } else { // other moves
-		 value = -full_search(board,-alpha-1,-alpha,new_depth,height+1,new_pv,NodeCut);
-         if (value > alpha) { // && value < beta
-			value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
+		 value = -full_search(board,search_stack,-alpha-1,-alpha,new_depth,height+1,new_pv,NodeCut);
+         CHECK_STOP(true);
+         if (value > alpha) {
+			value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
          }
       }
+      CHECK_STOP(true);
 
       // history-pruning re-search
 
@@ -763,11 +808,12 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
          ASSERT(node_type!=NodePV);
 
 		 //history_very_bad(move,board);
-		 SearchStack[height].reduced = false;
+		 search_stack[height].reduced = false;
          new_depth++;
          ASSERT(new_depth==depth-1);
 		 
-         value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+         value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+         CHECK_STOP(true);
       } 
 
       move_undo(board,move,undo);
@@ -780,7 +826,7 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
          if (value > alpha) {
             alpha = value;
             best_move = move;
-			SearchStack[height].best_move = move;
+			search_stack[height].best_move = move;
             if (value >= beta){ 
 				// history_success(move,board);
 				goto cut;
@@ -789,6 +835,25 @@ static int full_search(board_t * board, int alpha, int beta, int depth, int heig
       }
 
       if (node_type == NodeCut) node_type = NodeAll;
+
+#ifdef SMP
+      // Split the tree if there are idle threads.
+      if (idle_count > 0 && !in_check && node_type == NodeAll && played_nb > SplitMoveNb && depth >= SplitDepth) {
+#   ifdef SMP_DEBUG
+         send("%*scall%i=%i(%i,%i)\n",SplitCount[board->id],"",board->id,value,alpha,beta);
+#   endif
+         value = split(board,alpha,beta,depth,height,pv,sort,node_type,mate_threat);
+#  ifdef SMP_DEBUG
+         send("%*sreturned%i=%i(%i,%i)\n",SplitCount[board->id],"",board->id,value,alpha,beta);
+#  endif
+         CHECK_STOP(false);
+         if (value != ValueNone) {
+            if (value > best_value)
+               best_value = value;
+            goto split_cut;
+         }
+      }
+#endif
    }
 
    // ALL node
@@ -827,6 +892,8 @@ cut:
       }
    }
 
+split_cut:
+
    // transposition table
 
    if (UseTrans && depth >= TransDepth) {
@@ -842,9 +909,220 @@ cut:
    return best_value;
 }
 
+// full_split()
+
+#ifdef SMP
+int full_split(board_t * board, search_param_t * search_stack, int alpha, int beta, int depth,
+ int height, sort_t * sort, mv_t pv[], int node_type, bool mate_threat) {
+
+   int old_alpha;
+   int value, best_value;
+   int move, best_move;
+   int new_depth;
+   int played_nb;
+   int i;
+   int opt_value;
+   int sort_value;
+   bool reduced;
+   undo_t undo[1];
+   mv_t new_pv[HeightMax];
+   mv_t played[256];
+   int FutilityMargin;
+
+   CHECK_STOP(false);
+
+   ASSERT(board!=NULL);
+   ASSERT(range_is_ok(alpha,beta));
+   ASSERT(depth_is_ok(depth));
+   ASSERT(height_is_ok(height));
+   ASSERT(pv!=NULL);
+   ASSERT(node_type==NodePV||node_type==NodeCut||node_type==NodeAll);
+
+   ASSERT(board_is_legal(board));
+
+   // init
+
+   search_stack[height].best_move = MoveNone;
+   search_stack[height].move = MoveNone;
+   search_stack[height].threat_move = MoveNone;
+   search_stack[height].reduced = false;
+
+   Thread[board->id].node_nb++;
+   PV_CLEAR(pv);
+
+   old_alpha = alpha;
+   best_value = alpha;
+   best_move = MoveNone;
+   played_nb = 0;
+
+   if (height > SearchCurrent->max_depth) SearchCurrent->max_depth = height;
+
+   // move loop
+
+   opt_value = +ValueInf;
+
+   while ((move = split_sort_next(board, sort, &alpha, &sort_value)) != MoveNone) {
+	  search_stack[height].move = move;
+
+	  // history_tried(move,board);
+	  
+      // extensions
+
+      new_depth = full_new_depth(depth,move,board,false,mate_threat,node_type==NodePV, height);
+	  
+      // futility pruning
+
+	  if (UseFutility && depth <= 2 && node_type != NodePV) {
+		  
+         if (new_depth < depth && !move_is_tactical(move,board) && !move_is_dangerous(move,board)) {
+
+            ASSERT(!move_is_check(move,board));
+
+            // optimistic evaluation
+
+            if (opt_value == +ValueInf) {
+				if (depth==2){
+					FutilityMargin = FutilityMargin2;
+				}
+				else{
+					FutilityMargin = FutilityMargin1;
+				}
+				opt_value = eval(board,alpha,beta) + FutilityMargin;
+				ASSERT(opt_value<+ValueInf);
+            }
+
+            value = opt_value;
+
+            // pruning
+
+            if (value <= alpha) {
+
+               if (value > best_value) {
+                  best_value = value;
+                  PV_CLEAR(pv);
+               }
+
+               continue;
+            }
+         }
+      } 
+
+	  // history pruning
+
+/*      reduced = false;
+      if (UseHistory && depth >= HistoryDepth && node_type != NodePV) {
+         if (played_nb >= HistoryMoveNb && new_depth < depth) {
+            ASSERT(best_value!=ValueNone);
+            ASSERT(played_nb>0);
+            ASSERT(sort->pos>0&&move==LIST_MOVE(sort->list,sort->pos-1));
+            if (history_reduction(move,board) == true) {
+               ASSERT(sort_value>=0&&sort_value<16384);
+               ASSERT(move!=trans_move);
+               ASSERT(!move_is_tactical(move,board));
+               ASSERT(!move_is_check(move,board));
+               new_depth--;
+               reduced = true;
+            }
+         }
+      } */
+
+	  // history pruning
+
+      reduced = false;
+ //     if (depth <= 4 && node_type != NodePV && new_depth < depth && sort_value < (depth <= 3 ? HistoryValue / 3 : HistoryValue / 4)) 
+//		  continue;
+
+
+      if (UseHistory && depth >= HistoryDepth && node_type != NodePV && new_depth < depth && sort_value < HistoryValue) {
+         ASSERT(sort_value>=0&&sort_value<16384);
+         ASSERT(!move_is_tactical(move,board));
+         ASSERT(!move_is_check(move,board));
+         new_depth--;
+         reduced = true;
+         if (UseExtendedHistory && sort_value < HistoryValue / 2 && depth >= 8)
+            new_depth--;
+      }   
+
+	  search_stack[height].reduced = reduced;
+
+      // recursive search
+
+	  move_do(board,move,undo);
+
+      if (node_type != NodePV || best_value == ValueNone) { // first move
+		 value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+      } else { // other moves
+		 value = -full_search(board,search_stack,-alpha-1,-alpha,new_depth,height+1,new_pv,NodeCut);
+         CHECK_STOP(true);
+         if (value > alpha && value < beta) {
+			value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NodePV);
+         }
+      }
+      CHECK_STOP(true);
+
+      // history-pruning re-search
+
+	  if (HistoryReSearch && reduced && value > alpha /* was >= beta */) {
+
+         ASSERT(node_type!=NodePV);
+
+		 //history_very_bad(move,board);
+		 search_stack[height].reduced = false;
+         new_depth++;
+         ASSERT(new_depth==depth-1);
+		 
+         value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+         CHECK_STOP(true);
+      } 
+
+      move_undo(board,move,undo);
+
+      played[played_nb++] = move;
+
+      if (value > best_value) {
+         best_value = value;
+         pv_cat(pv,new_pv,move);
+         if (value > alpha) {
+            alpha = value;
+            best_move = move;
+			search_stack[height].best_move = move;
+            if (value >= beta){ 
+				// history_success(move,board);
+				goto cut;
+			}
+         }
+      }
+
+      if (node_type == NodeCut) node_type = NodeAll;
+   }
+
+cut:
+/*
+   if (best_move != MoveNone) {
+
+      good_move(best_move,board,depth,height);
+
+      if (best_value >= beta && !move_is_tactical(best_move,board)) {
+
+		 ASSERT(played_nb>0&&played[played_nb-1]==best_move);
+
+         for (i = 0; i < played_nb-1; i++) {
+            move = played[i];
+            ASSERT(move!=best_move);
+            history_bad(move,board);
+         }
+
+         history_good(best_move,board);
+      }
+   }
+*/
+   return best_value;
+}
+#endif
+
 // full_no_null()
 
-static int full_no_null(board_t * board, int alpha, int beta, int depth, int height, mv_t pv[], int node_type, int trans_move, int * best_move) {
+static int full_no_null(board_t * board, search_param_t * search_stack, int alpha, int beta, int depth, int height, mv_t pv[], int node_type, int trans_move, int * best_move) {
 
    int value, best_value;
    int move;
@@ -853,6 +1131,8 @@ static int full_no_null(board_t * board, int alpha, int beta, int depth, int hei
    sort_t sort[1];
    undo_t undo[1];
    mv_t new_pv[HeightMax];
+
+   CHECK_STOP(false);
 
    ASSERT(board!=NULL);
    ASSERT(range_is_ok(alpha,beta));
@@ -869,20 +1149,22 @@ static int full_no_null(board_t * board, int alpha, int beta, int depth, int hei
 
    // init
 
-   SearchStack[height].best_move = MoveNone;
-   SearchStack[height].move = MoveNone;
-   SearchStack[height].threat_move = MoveNone;
-   SearchStack[height].reduced = false;
+   search_stack[height].best_move = MoveNone;
+   search_stack[height].move = MoveNone;
+   search_stack[height].threat_move = MoveNone;
+   search_stack[height].reduced = false;
 
-   SearchCurrent->node_nb++;
-   SearchInfo->check_nb--;
+   Thread[board->id].node_nb++;
    PV_CLEAR(pv);
 
    if (height > SearchCurrent->max_depth) SearchCurrent->max_depth = height;
 
-   if (SearchInfo->check_nb <= 0) {
-      SearchInfo->check_nb += SearchInfo->check_inc;
-      search_check();
+   if (board->id == 0) {
+      SearchInfo->check_nb--;
+      if (SearchInfo->check_nb <= 0) {
+         SearchInfo->check_nb += SearchInfo->check_inc;
+         search_check();
+      }
    }
 
    attack_set(attack,board);
@@ -897,13 +1179,14 @@ static int full_no_null(board_t * board, int alpha, int beta, int depth, int hei
 
    while ((move=sort_next(sort)) != MoveNone) {
 
-	  SearchStack[height].move = move;
+	  search_stack[height].move = move;
 
       new_depth = full_new_depth(depth,move,board,false,false,false,height);
 
       move_do(board,move,undo);
-      value = -full_search(board,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
+      value = -full_search(board,search_stack,-beta,-alpha,new_depth,height+1,new_pv,NODE_OPP(node_type));
       move_undo(board,move,undo);
+      CHECK_STOP(false);
 
       if (value > best_value) {
          best_value = value;
@@ -911,7 +1194,7 @@ static int full_no_null(board_t * board, int alpha, int beta, int depth, int hei
          if (value > alpha) {
             alpha = value;
             *best_move = move;
-			SearchStack[height].best_move = move;
+			search_stack[height].best_move = move;
             if (value >= beta) goto cut;
          }
       }
@@ -933,7 +1216,7 @@ cut:
 
 // full_quiescence()
 
-static int full_quiescence(board_t * board, int alpha, int beta, int depth, int height, mv_t pv[]) {
+static int full_quiescence(board_t * board, search_param_t * search_stack, int alpha, int beta, int depth, int height, mv_t pv[]) {
 
    bool in_check;
    int old_alpha;
@@ -947,6 +1230,8 @@ static int full_quiescence(board_t * board, int alpha, int beta, int depth, int 
    mv_t new_pv[HeightMax];
    int cd;
 
+   CHECK_STOP(false);
+
    ASSERT(board!=NULL);
    ASSERT(range_is_ok(alpha,beta));
    ASSERT(depth_is_ok(depth));
@@ -958,20 +1243,22 @@ static int full_quiescence(board_t * board, int alpha, int beta, int depth, int 
 
    // init
 
-   SearchStack[height].best_move = MoveNone;
-   SearchStack[height].move = MoveNone;
-   SearchStack[height].threat_move = MoveNone;
-   SearchStack[height].reduced = false;
+   search_stack[height].best_move = MoveNone;
+   search_stack[height].move = MoveNone;
+   search_stack[height].threat_move = MoveNone;
+   search_stack[height].reduced = false;
 
-   SearchCurrent->node_nb++;
-   SearchInfo->check_nb--;
+   Thread[board->id].node_nb++;
    PV_CLEAR(pv);
 
    if (height > SearchCurrent->max_depth) SearchCurrent->max_depth = height;
 
-   if (SearchInfo->check_nb <= 0) {
-      SearchInfo->check_nb += SearchInfo->check_inc;
-      search_check();
+   if (board->id == 0) {
+      SearchInfo->check_nb--;
+      if (SearchInfo->check_nb <= 0) {
+         SearchInfo->check_nb += SearchInfo->check_inc;
+         search_check();
+      }
    }
 
    // draw?
@@ -1057,7 +1344,7 @@ static int full_quiescence(board_t * board, int alpha, int beta, int depth, int 
 
    while ((move=sort_next_qs(sort)) != MoveNone) {
 
-	  SearchStack[height].move = move;
+	  search_stack[height].move = move;
 
       // delta pruning
 
@@ -1097,8 +1384,10 @@ static int full_quiescence(board_t * board, int alpha, int beta, int depth, int 
       }
 
       move_do(board,move,undo);
-      value = -full_quiescence(board,-beta,-alpha,depth-1,height+1,new_pv);
+      value = -full_quiescence(board,search_stack,-beta,-alpha,depth-1,height+1,new_pv);
       move_undo(board,move,undo);
+
+      CHECK_STOP(false);
 
       if (value > best_value) {
          best_value = value;
@@ -1106,7 +1395,7 @@ static int full_quiescence(board_t * board, int alpha, int beta, int depth, int 
          if (value > alpha) {
             alpha = value;
             best_move = move;
-			SearchStack[height].best_move = move;
+			search_stack[height].best_move = move;
             if (value >= beta) goto cut;
          }
       }
@@ -1152,8 +1441,9 @@ static int full_new_depth(int depth, int move, board_t * board, bool single_repl
    }
    //else{ 
 		if ((single_reply && ExtendSingleReply)
-			|| (in_pv && MOVE_TO(move) == board->cap_sq // recapture
-		/*		&& (see_move(move,board) > 0 || ABS(VALUE_PIECE(board->square[MOVE_TO(move)])-VALUE_PIECE(board->square[MOVE_FROM(move)])) <= 250 ) */)  
+			|| (in_pv && MOVE_TO(move) == board->cap_sq) // recapture
+		/*		&& (see_move(move,board) > 0 || ABS(VALUE_PIECE(board->square[MOVE_TO(move)])-VALUE_PIECE(board->square[MOVE_FROM(move)])) <= 250 ) */
+//)  
 			|| (in_pv && PIECE_IS_PAWN(MOVE_PIECE(move,board))
 				  && (PAWN_RANK(MOVE_TO(move),board->turn) == Rank7 || PAWN_RANK(MOVE_TO(move),board->turn) == Rank6)
 				  /* && see_move(move,board) >= 0 */)

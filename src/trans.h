@@ -8,9 +8,25 @@
 
 #include "util.h"
 
+// constants
+
+static const int DateSize = 16;
+
 // types
 
-typedef struct trans trans_t;
+typedef struct {
+   struct entry_t * table;
+   uint32 size;
+   uint32 mask;
+   int date;
+   int age[DateSize];
+   uint32 used;
+   sint64 read_nb;
+   sint64 read_hit;
+   sint64 write_nb;
+   sint64 write_hit;
+   sint64 write_collision;
+} trans_t;
 
 // variables
 

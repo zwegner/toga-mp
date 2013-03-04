@@ -15,6 +15,7 @@
 #include "piece.h"
 #include "protocol.h"
 #include "random.h"
+#include "smp.h"
 #include "square.h"
 #include "trans.h"
 #include "util.h"
@@ -50,7 +51,12 @@ int main(int argc, char * argv[]) {
    hash_init();
 
    trans_init(Trans);
+
    book_init();
+
+#ifdef SMP
+   smp_init(ThreadMax);
+#endif
 
    // loop
 

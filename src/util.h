@@ -10,6 +10,20 @@
 
 // constants
 
+//#define SMP
+//#define DEBUG
+
+#ifdef SMP
+
+const int ThreadMax = 2;
+
+#else
+
+const int thread_count = 1;
+const int ThreadMax = 1;
+
+#endif
+
 #undef FALSE
 #define FALSE 0
 
@@ -47,6 +61,7 @@
 #else
 #  define ASSERT(a)
 #endif
+
 
 // types
 

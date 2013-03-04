@@ -20,8 +20,6 @@
 
 static const bool UseModulo = false;
 
-static const int DateSize = 16;
-
 static const int ClusterSize = 4; // TODO: unsigned?
 
 static const int DepthNone = -128;
@@ -30,29 +28,30 @@ static const int DepthNone = -128;
 
 struct entry_t {
    uint32 lock;
-   uint16 move;
-   sint8 depth;
-   uint8 date;
-   sint8 move_depth;
-   uint8 flags;
-   sint8 min_depth;
-   sint8 max_depth;
-   sint16 min_value;
-   sint16 max_value;
-};
-
-struct trans { // HACK: typedef'ed in trans.h
-   entry_t * table;
-   uint32 size;
-   uint32 mask;
-   int date;
-   int age[DateSize];
-   uint32 used;
-   sint64 read_nb;
-   sint64 read_hit;
-   sint64 write_nb;
-   sint64 write_hit;
-   sint64 write_collision;
+   union {
+      struct {
+         uint16 move;
+         sint8 depth;
+         uint8 date;
+      };
+      uint32 key1;
+   };
+   union {
+      struct {
+         sint8 move_depth;
+         uint8 flags;
+         sint8 min_depth;
+         sint8 max_depth;
+      };
+      uint32 key2;
+   };
+   union {
+      struct {
+         sint16 min_value;
+         sint16 max_value;
+      };
+      uint32 key3;
+   };
 };
 
 // variables
@@ -240,7 +239,7 @@ static int trans_age(const trans_t * trans, int date) {
 
 void trans_store(trans_t * trans, uint64 key, int move, int depth, int min_value, int max_value) {
 
-   entry_t * entry, * best_entry;
+   entry_t * entry, * best_entry, new_entry;
    int score, best_score;
    int i;
 
@@ -264,35 +263,40 @@ void trans_store(trans_t * trans, uint64 key, int move, int depth, int min_value
 
    for (i = 0; i < ClusterSize; i++, entry++) {
 
-      if (entry->lock == KEY_LOCK(key)) {
+      if (entry->lock == KEY_LOCK(key) /*^ entry->key1 ^ entry->key2 ^ entry->key3*/) {
 
          // hash hit => update existing entry
+         new_entry = *entry;
 
          trans->write_hit++;
          if (entry->date != trans->date) trans->used++;
 
-         entry->date = trans->date;
+         new_entry.date = trans->date;
 
-         if (trans_endgame || depth > entry->depth) entry->depth = depth; 
+         if (trans_endgame || depth > entry->depth)
+            new_entry.depth = depth; 
 		 /* if (depth > entry->depth)  entry->depth = depth; // for replacement scheme */
 		 
          // if (move != MoveNone /* && depth >= entry->move_depth */) {
 		 if (move != MoveNone && (trans_endgame || depth >= entry->move_depth)) {
-            entry->move_depth = depth;
-            entry->move = move;
+            new_entry.move_depth = depth;
+            new_entry.move = move;
          }
 
          // if (min_value > -ValueInf /* && depth >= entry->min_depth */) {
 	     if (min_value > -ValueInf && (trans_endgame || depth >= entry->min_depth)) {
-            entry->min_depth = depth;
-            entry->min_value = min_value;
+            new_entry.min_depth = depth;
+            new_entry.min_value = min_value;
          }
 
          // if (max_value < +ValueInf /* && depth >= entry->max_depth */) {
          if (max_value < +ValueInf && (trans_endgame || depth >= entry->max_depth)) {
-            entry->max_depth = depth;
-            entry->max_value = max_value;
+            new_entry.max_depth = depth;
+            new_entry.max_value = max_value;
          }
+
+         new_entry.lock = KEY_LOCK(key) /*^ entry->key1 ^ entry->key2 ^ entry->key3*/;
+         *entry = new_entry;
 
          ASSERT(entry_is_ok(entry));
 
@@ -312,11 +316,9 @@ void trans_store(trans_t * trans, uint64 key, int move, int depth, int min_value
 
    // "best" entry found
 
-   entry = best_entry;
-   ASSERT(entry!=NULL);
-   ASSERT(entry->lock!=KEY_LOCK(key));
+   ASSERT(best_entry!=NULL);
 
-   if (entry->date == trans->date) {
+   if (best_entry->date == trans->date) {
       trans->write_collision++;
    } else {
       trans->used++;
@@ -324,20 +326,20 @@ void trans_store(trans_t * trans, uint64 key, int move, int depth, int min_value
 
    // store
 
-   ASSERT(entry!=NULL);
+   new_entry.date = trans->date;
 
-   entry->lock = KEY_LOCK(key);
-   entry->date = trans->date;
+   new_entry.depth = depth;
 
-   entry->depth = depth;
+   new_entry.move_depth = (move != MoveNone) ? depth : DepthNone;
+   new_entry.move = move;
 
-   entry->move_depth = (move != MoveNone) ? depth : DepthNone;
-   entry->move = move;
+   new_entry.min_depth = (min_value > -ValueInf) ? depth : DepthNone;
+   new_entry.max_depth = (max_value < +ValueInf) ? depth : DepthNone;
+   new_entry.min_value = min_value;
+   new_entry.max_value = max_value;
 
-   entry->min_depth = (min_value > -ValueInf) ? depth : DepthNone;
-   entry->max_depth = (max_value < +ValueInf) ? depth : DepthNone;
-   entry->min_value = min_value;
-   entry->max_value = max_value;
+   new_entry.lock = KEY_LOCK(key) /*^ new_entry.key1 ^ new_entry.key2 ^ new_entry.key3*/;
+   *best_entry = new_entry;
 
    ASSERT(entry_is_ok(entry));
 }
@@ -366,12 +368,15 @@ bool trans_retrieve(trans_t * trans, uint64 key, int * move, int * min_depth, in
 
    for (i = 0; i < ClusterSize; i++, entry++) {
 
-      if (entry->lock == KEY_LOCK(key)) {
+      if (entry->lock == KEY_LOCK(key) /*^ entry->key1 ^ entry->key2 ^ entry->key3*/) {
 
          // found
 
          trans->read_hit++;
-         if (entry->date != trans->date) entry->date = trans->date;
+         if (entry->date != trans->date) {
+            entry->date = trans->date;
+            entry->lock == KEY_LOCK(key) /*^ entry->key1 ^ entry->key2 ^ entry->key3*/;
+         }
 
          *move = entry->move;
 

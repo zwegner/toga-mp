@@ -36,6 +36,7 @@ static const int CODE_SIZE = 256;
 
 // macros
 
+#define MIN(X, Y)  ((X) < (Y) ? (X) : (Y))
 #define HISTORY_INC(depth) ((depth)*(depth))
 
 // types
@@ -78,7 +79,7 @@ static int PosCaptureQS;
 
 static int Code[CODE_SIZE];
 
-static uint16 Killer[HeightMax][KillerNb];
+static uint16 Killer[ThreadMax][HeightMax][KillerNb];
 
 static fail_high_stats_t FailHighStats[HistorySize];
 static uint16 History[HistorySize];
@@ -111,13 +112,15 @@ static int  history_index     (int move, const board_t * board);
 
 void sort_init() {
 
-   int i, height;
+   int i, height, thread;
    int pos;
 
    // killer
 
-   for (height = 0; height < HeightMax; height++) {
-      for (i = 0; i < KillerNb; i++) Killer[height][i] = MoveNone;
+   for (thread = 0; thread < ThreadMax; thread++) {
+      for (height = 0; height < HeightMax; height++) {
+         for (i = 0; i < KillerNb; i++) Killer[thread][height][i] = MoveNone;
+      }
    }
 
    // history
@@ -187,11 +190,15 @@ void sort_init(sort_t * sort, board_t * board, const attack_t * attack, int dept
    sort->height = height;
 
    sort->trans_killer = trans_killer;
-   sort->killer_1 = Killer[sort->height][0];
-   sort->killer_2 = Killer[sort->height][1];
+   sort->killer_1 = Killer[board->id][sort->height][0];
+   sort->killer_2 = Killer[board->id][sort->height][1];
    if (sort->height > 2){
-	  sort->killer_3 = Killer[sort->height-2][0];
-      sort->killer_4 = Killer[sort->height-2][1]; 
+	  sort->killer_3 = Killer[board->id][sort->height-2][0];
+      if (sort->killer_3 == sort->killer_1 || sort->killer_3 == sort->killer_2)
+         sort->killer_3 = MoveNone;
+      sort->killer_4 = Killer[board->id][sort->height-2][1]; 
+      if (sort->killer_4 == sort->killer_1 || sort->killer_4 == sort->killer_2)
+         sort->killer_4 = MoveNone;
    }
    else{
       sort->killer_3 = MoveNone;
@@ -305,8 +312,9 @@ int sort_next(sort_t * sort) {
       }
 
       // next stage
-
-      gen = Code[sort->gen++];
+      gen = Code[sort->gen];
+      if (gen != GEN_END) // for SMP
+         sort->gen++;
 
       if (false) {
 
@@ -497,13 +505,13 @@ void good_move(int move, const board_t * board, int depth, int height) {
 
    // killer
 
-   if (Killer[height][0] != move) {
-      Killer[height][1] = Killer[height][0];
-      Killer[height][0] = move;
+   if (Killer[board->id][height][0] != move) {
+      Killer[board->id][height][1] = Killer[board->id][height][0];
+      Killer[board->id][height][0] = move;
    }
 
-   ASSERT(Killer[height][0]==move);
-   ASSERT(Killer[height][1]!=move);
+   ASSERT(Killer[board->id][height][0] == move);
+   ASSERT(Killer[board->id][height][1] != move);
 
    // history
 
@@ -540,9 +548,6 @@ void history_good(int move, const board_t * board) {
       HistHit[index] = (HistHit[index] + 1) / 2;
       HistTot[index] = (HistTot[index] + 1) / 2;
    }
-
-   ASSERT(HistHit[index]<=HistTot[index]);
-   ASSERT(HistTot[index]<HistoryMax);
 }
 
 // history_bad()
@@ -566,9 +571,6 @@ void history_bad(int move, const board_t * board) {
       HistHit[index] = (HistHit[index] + 1) / 2;
       HistTot[index] = (HistTot[index] + 1) / 2;
    }
-
-   ASSERT(HistHit[index]<=HistTot[index]);
-   ASSERT(HistTot[index]<HistoryMax);
 }
 
 // history_very_bad()
@@ -592,9 +594,6 @@ void history_very_bad(int move, const board_t * board) {
       HistHit[index] = (HistHit[index] + 1) / 2;
       HistTot[index] = (HistTot[index] + 1) / 2;
    }
-
-   ASSERT(HistHit[index]<=HistTot[index]);
-   ASSERT(HistTot[index]<HistoryMax);
 }
 
 // history_tried()
@@ -767,13 +766,13 @@ static int move_value(int move, const board_t * board, int height, int trans_kil
       value = TransScore;
    } else if (move_is_tactical(move,board)) { // capture or promote
       value = capture_value(move,board);
-   } else if (move == Killer[height][0]) { // killer 1
+   } else if (move == Killer[board->id][height][0]) { // killer 1
       value = KillerScore;
-   } else if (move == Killer[height][1]) { // killer 2
+   } else if (move == Killer[board->id][height][1]) { // killer 2
       value = KillerScore - 2;
-   } else if (height > 2 && move == Killer[height-2][0]) { // killer 3
+   } else if (height > 2 && move == Killer[board->id][height-2][0]) { // killer 3
       value = KillerScore - 1;
-   } else if (height > 2 && move == Killer[height-2][1]) { // killer 4
+   } else if (height > 2 && move == Killer[board->id][height-2][1]) { // killer 4
       value = KillerScore - 3;
    } else { // quiet move
       value = quiet_move_value(move,board);
@@ -855,11 +854,10 @@ static int history_prob(int move, const board_t * board) {
 
    index = history_index(move,board);
 
-   ASSERT(HistHit[index]<=HistTot[index]);
-   ASSERT(HistTot[index]<HistoryMax);
-
    value = (HistHit[index] * 16384) / HistTot[index];
-   ASSERT(value>=0&&value<=16384);
+   value = MIN(value, 16384);
+
+   ASSERT(value>=0);
 
    return value;
 }

@@ -22,6 +22,7 @@
 #include "protocol.h"
 #include "pst.h"
 #include "search.h"
+#include "smp.h"
 #include "trans.h"
 #include "util.h"
 
@@ -83,6 +84,7 @@ void loop() {
    search_clear();
 
    board_from_fen(SearchInput->board,StartFen);
+   SearchInput->board->id = 0;
 
    // loop
 
@@ -572,6 +574,8 @@ static void send_best_move() {
 
    // HACK: should be in search.cpp
 
+   search_update_current();
+
    time = SearchCurrent->time;
    speed = SearchCurrent->speed;
    cpu = SearchCurrent->cpu;
@@ -623,7 +627,9 @@ void send(const char format[], ...) {
    vsprintf(string,format,arg_list);
    va_end(arg_list);
 
+   LOCK_SET(IOLock);
    fprintf(stdout,"%s\n",string);
+   LOCK_CLEAR(IOLock);
 }
 
 // string_equal()

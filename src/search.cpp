@@ -21,6 +21,7 @@
 #include "pv.h"
 #include "search.h"
 #include "search_full.h"
+#include "smp.h"
 #include "sort.h"
 #include "trans.h"
 #include "util.h"
@@ -56,7 +57,7 @@ static const bool UseExtension = true;
 static search_multipv_t save_multipv[MultiPVMax];
 
 bool trans_endgame;
-search_param_t SearchStack[HeightMax];
+search_param_t SearchStack[ThreadMax][HeightMax];
 
 search_input_t SearchInput[1];
 search_info_t SearchInfo[1];
@@ -132,6 +133,18 @@ void search_clear() {
    SearchCurrent->time = 0.0;
    SearchCurrent->speed = 0.0;
    SearchCurrent->cpu = 0.0;
+
+   // Threads
+#ifdef SMP
+   for (int thread = 0; thread < thread_count; thread++)
+      Thread[thread].node_nb = 0;
+
+#  ifdef SMP_STATS
+   split_nb = 0;
+   stop_nb = 0;
+#  endif
+
+#endif
 }
 
 // search()
@@ -477,12 +490,16 @@ void search_update_root() {
 
 void search_update_current() {
 
+   int thread;
    my_timer_t *timer;
    sint64 node_nb;
    double time, speed, cpu;
 
    timer = SearchCurrent->timer;
 
+   SearchCurrent->node_nb = 0;
+   for (thread = 0; thread < thread_count; thread++)
+      SearchCurrent->node_nb += Thread[thread].node_nb;
    node_nb = SearchCurrent->node_nb;
    time = (UseCpuTime) ? my_timer_elapsed_cpu(timer) : my_timer_elapsed_real(timer);
    speed = (time >= 1.0) ? double(node_nb) / time : 0.0;
@@ -521,6 +538,7 @@ void search_check() {
 
    if (SearchInfo->can_stop 
     && (SearchInfo->stop || (SearchRoot->flag && !SearchInput->infinite))) {
+      SearchInfo->stop = true;
       longjmp(SearchInfo->buf,1);
    }
 }
@@ -542,6 +560,10 @@ static void search_send_stat() {
       speed = SearchCurrent->speed;
       cpu = SearchCurrent->cpu;
       node_nb = SearchCurrent->node_nb;
+
+#ifdef SMP_STATS
+      send("splits=%i stops=%i", split_nb, stop_nb);
+#endif
 
       send("info time %.0f nodes " S64_FORMAT " nps %.0f cpuload %.0f",time*1000.0,node_nb,speed,cpu*1000.0);
 

@@ -105,7 +105,7 @@ struct search_current_t {
 
 // variables
 
-extern search_param_t SearchStack[HeightMax]; // Thomas
+extern search_param_t SearchStack[ThreadMax][HeightMax]; // Thomas
 extern search_input_t SearchInput[1];
 extern search_info_t SearchInfo[1];
 extern search_best_t SearchBest[MultiPVMax];

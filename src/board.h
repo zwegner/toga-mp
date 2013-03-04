@@ -6,6 +6,8 @@
 
 // includes
 
+struct board_t;
+
 #include "colour.h"
 #include "piece.h"
 #include "square.h"
@@ -78,6 +80,8 @@ struct board_t {
    uint64 material_key;
 
    uint64 stack[StackSize];
+
+   int id;
 };
 
 // functions

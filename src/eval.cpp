@@ -260,7 +260,7 @@ int eval(const board_t * board, int alpha, int beta) {
    int phase;
    int eval;
    int wb, bb;
-   int lazy_eval // Thomas
+   int lazy_eval; // Thomas
 
    ASSERT(board!=NULL);
 
@@ -340,7 +340,7 @@ int eval(const board_t * board, int alpha, int beta) {
 	 phase = mat_info->phase;
      lazy_eval = ((opening * (256 - mat_info->phase)) + (endgame * mat_info->phase)) / 256;
 
-     ASSERT(eval>=-ValueEvalInf&&eval<=+ValueEvalInf);
+     ASSERT(lazy_eval>=-ValueEvalInf&&lazy_eval<=+ValueEvalInf);
 
 	 if (COLOUR_IS_BLACK(board->turn)) lazy_eval = -lazy_eval;
 	 if (lazy_eval - lazy_eval_cutoff >= beta)

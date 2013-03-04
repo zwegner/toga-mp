@@ -107,7 +107,7 @@ void material_init() {
 
 void material_alloc() {
 
-   ASSERT(sizeof(entry_t)==16);
+   ASSERT(sizeof(entry_t)==32);
 
    if (UseTable) {
 
@@ -202,7 +202,7 @@ static void material_comp_info(material_info_t * info, const board_t * board) {
    int phase;
    int opening, endgame;
    int owf,obf,ewf,ebf; /* Thomas */
-   int WhiteMinors,BlackMinors,WhiteMajors,BlackMajors
+   int WhiteMinors,BlackMinors,WhiteMajors,BlackMajors;
 
    ASSERT(info!=NULL);
    ASSERT(board!=NULL);
