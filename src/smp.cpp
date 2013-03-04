@@ -155,7 +155,6 @@ int thread_wait(int id, split_t * split_point) {
             Thread[id].split_point->stop = true;
          }
          Thread[id].split_point->alpha = value;
-         pv_copy(Thread[id].split_point->pv, pv);
       }
       Thread[id].split_point->child_count--;
       Thread[id].split_point->child[id] = false;
@@ -183,21 +182,13 @@ int split(board_t * board, int alpha, int beta, int depth, int height, mv_t * pv
       return ValueNone;
    split_point = &SplitPoint[board->id][Thread[board->id].split_count++];
 
-   LOCK_SET(SmpLock);
-   // Check that there are still idle threads.
-   if (idle_count == 0) {
-      LOCK_CLEAR(SmpLock);
-      return ValueNone;
-   }
    ASSERT(!Thread[board->id].idle);
+   ASSERT(!Thread[board->id].work_available);
+
    old_split_point = Thread[board->id].split_point;
    Thread[board->id].idle = true;
-   idle_count++;
 
    // Set up the split point
-#ifdef SMP_STATS
-   split_nb++;
-#endif
    split_point->active = true;
    split_point->stop = false;
    split_point->alpha = alpha;
@@ -211,6 +202,20 @@ int split(board_t * board, int alpha, int beta, int depth, int height, mv_t * pv
    split_point->parent = board->id;
 
    split_point->child_count = 0;
+
+   LOCK_SET(SmpLock);
+   // Check that there are still idle threads.
+   if (idle_count == 0) {
+      Thread[board->id].split_count--;
+      Thread[board->id].idle = true;
+      LOCK_CLEAR(SmpLock);
+      return ValueNone;
+   }
+   idle_count++;
+#ifdef SMP_STATS
+   split_nb++;
+#endif
+
    for (thread = 0; thread < thread_count; thread++) {
       if (Thread[thread].idle && !Thread[thread].work_available) {
          idle_count--;
@@ -223,15 +228,13 @@ int split(board_t * board, int alpha, int beta, int depth, int height, mv_t * pv
       } else
          split_point->child[thread] = false;
    }
-   // Tell all the processors where to go.
-/*   for (thread = 0; thread < thread_count; thread++) {
-      if (split_point->child[thread]) {
-      }
-   }
-  */ LOCK_CLEAR(SmpLock);
+   LOCK_CLEAR(SmpLock);
 
    // The split point is set up. Now enter the wait function so that we can search and then wait for the other threads.
    value = thread_wait(board->id, split_point);
+
+   pv_copy(split_point->pv, pv);
+
    // Destroy the split point.
    split_point->active = false;
    split_point->stop = false;
